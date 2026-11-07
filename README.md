@@ -4,6 +4,8 @@ A VT100 terminal on an RP2350, with no PSRAM needed: 640x480 in 256 colours on H
 
 libvterm does the terminal's work, so it is more than a VT100: xterm's 256 colours, UTF-8, CP437 and Latin-1, VT52 mode, double-width and double-height lines, mouse reporting, an alternate screen and scrollback.
 
+The [user manual](docs/VT2350_User_Manual.pdf) is a PDF, for downloading and printing. It covers wiring one up, the setup menu, the keys and what to do when something is wrong.
+
 ## Hardware
 
 | | |
