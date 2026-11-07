@@ -291,7 +291,7 @@ def body(m):
         ['LF received as', 'LF, CR LF', 'LF'],
         ['Local echo', 'Off, On: On shows what you type, for a host that does not', 'Off'],
         ['Bell', 'Tone, Flash, Off', 'Tone'],
-        ['HDMI wiring', 'Section 10', 'Depends on the build'],
+        ['HDMI wiring', 'Section 10', '2,0,6,4'],
     ])
     m.table([42, 128], ['Line', 'What it does'], [
         ['Reset the terminal', 'Clears the screen and the scrollback and resets the terminal, then leaves the menu'],
@@ -360,7 +360,7 @@ def body(m):
 
     m.h1('HDMI wiring')
     m.para('Boards put the four HDMI pairs on GP12 to GP19 in different orders. The wiring is four numbers, the same as the PicoMite\'s `OPTION HDMI PINS`, for the clock, D0, D1 and D2 pairs. Each number is 0 for GP12 up to 7 for GP19, and gives the pair\'s positive pin. There are 384 possible wirings, and any of them can be used.')
-    m.para('The terminal takes the wiring from the first of these that gives one: the straps, then the saved wiring, then the build\'s own, which is 2,0,6,4.')
+    m.para('The terminal takes the wiring from the first of these that gives one: the straps, then the saved wiring, then the default, 2,0,6,4.')
     m.h2('Straps')
     m.para('Tie GP6 and GP7 to ground or 3.3 V, or leave them open. They are read each time the board starts.')
     m.table([24, 24, 26, 96], ['GP6', 'GP7', 'Wiring', 'Board'], [

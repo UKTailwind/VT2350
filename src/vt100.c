@@ -151,11 +151,19 @@ static int waitkey(void) {
     }
 }
 
+/* Every message box is the same size, as one drawn over a wider one would leave the end of it showing */
+#define MESSAGE_W 58
+
+static int message_w(void) {
+    return MESSAGE_W < scrc - 2 ? MESSAGE_W : scrc - 2;
+}
+
+static int message_col(void) {
+    return (scrc - message_w()) / 2;
+}
+
 static void message(const char *title, const char *text) {
-    int w = (int)strlen(text) + 4, col, row = scrr / 2 - 2;
-    if(w < (int)strlen(title) + 4) w = strlen(title) + 4;
-    if(w > scrc - 2) w = scrc - 2;
-    col = (scrc - w) / 2;
+    int w = message_w(), col = message_col(), row = scrr / 2 - 2;
     fill_box(col, row, w, 5);
     vtt_text(col + 2, row + 1, title, C_SEL, C_BOX);
     vtt_text(col + 2, row + 3, text, C_TEXT, C_BOX);
@@ -251,7 +259,7 @@ static void wiring_try(const uint8_t *first) {
         plat_wiring(w);
         snprintf(b, sizeof(b), "%d,%d,%d,%d: Enter keeps it, Esc goes back", w[0], w[1], w[2], w[3]);
         message("HDMI wiring", b);
-        i = (scrc - (int)strlen(b) - 4) / 2 + 15;       /* after the title: only colours show D1 and D2 changing places, as white and blue stay as they are */
+        i = message_col() + 15;                         /* after the title: only colours show D1 and D2 changing places, as white and blue stay as they are */
         vtt_text(i, scrr / 2 - 1, "Red", 196, C_BOX);
         vtt_text(i + 4, scrr / 2 - 1, "Green", 28, C_BOX);
         vtt_text(i + 10, scrr / 2 - 1, "Blue", 21, C_BOX);
