@@ -1,0 +1,362 @@
+--- a/src/portable/raspberrypi/rp2040/hcd_rp2040.c
++++ b/src/portable/raspberrypi/rp2040/hcd_rp2040.c
+@@ -11,8 +11,15 @@
+ #if CFG_TUH_ENABLED && (CFG_TUSB_MCU == OPT_MCU_RP2040) && !CFG_TUH_RPI_PIO_USB && !CFG_TUH_MAX3421
+ 
+   #include "pico.h"
++  #include "hardware/timer.h" /* PicoMite: time_us_32 for the RX-timeout grace window */
++  #include "hardware/sync.h"  /* PicoMite: save_and_disable_interrupts for a thread-context hcd_int_handler() */
+ 
+-  #if defined(PICO_RP2350) && PICO_RP2350 == 1
++  /* PicoMite: PM_FORCE_EPX_SOF makes an RP2350 build take the RP2040 EPX
++     path (SOF round-robin + STOP_TRANS) instead of the hardware
++     stop-on-NAK path, so RP2040-only code can be exercised on RP2350
++     hardware.  Both registers the SOF path touches (NAK_POLL, SOF_RD)
++     exist on RP2350.  Diagnostic only - never define it for a release. */
++  #if defined(PICO_RP2350) && PICO_RP2350 == 1 && !defined(PM_FORCE_EPX_SOF)
+     #define HAS_STOP_EPX_ON_NAK
+   #endif
+ 
+@@ -33,11 +40,30 @@
+ //--------------------------------------------------------------------+
+ 
+ // Host mode uses one shared endpoint register for non-interrupt endpoint
+-static hw_endpoint_t  ep_pool[USB_MAX_ENDPOINTS];
++/* PicoMite: one entry per open endpoint of every device, EP0s included.  Only interrupt endpoints need
++   one of the controller's 15 hardware slots; control and bulk endpoints share EPX and are software state
++   here, so the pool need not be USB_MAX_ENDPOINTS (16) long.  16 left 15 entries for everything: a hub (2),
++   a CDC adapter (4), a keyboard with a media-keys interface (3), a two-interface mouse (3) and a flash
++   drive (3) fill it, and one more interface made the last device's driver fail to open - the Colour
++   Maximite 2's DWC2 host ran out the same way with that set.  20 bytes an entry. */
++#define PM_HCD_EP_POOL 32
++static hw_endpoint_t  ep_pool[PM_HCD_EP_POOL];
+ static hw_endpoint_t *epx = &ep_pool[0]; // current active endpoint
+ 
+   #ifndef HAS_STOP_EPX_ON_NAK
+ static volatile bool epx_switch_request = false;
++
++/* PicoMite diagnostic counters for the SOF round-robin.  Always compiled where
++   the SOF path itself is (RP2040 always; RP2350 only under PM_FORCE_EPX_SOF) -
++   they cost 12 bytes of BSS and three increments, and they are the only way to
++   tell whether the round-robin is even running on a board in the field.
++   Non-static so they can be read from BASIC with PEEK(WORD ...):
++     pm_epx_contend  - a SOF found another endpoint pending while EPX was ACTIVE
++     pm_epx_switch   - EPX was actually preempted (STOP_TRANS + toggle rebuild)
++     pm_epx_declined - preempt declined because the transfer had moved data */
++volatile uint32_t pm_epx_contend;
++volatile uint32_t pm_epx_switch;
++volatile uint32_t pm_epx_declined;
+   #endif
+ 
+ enum {
+@@ -137,7 +163,8 @@
+ //   OUT completed: FULL cleared to 0 in STATUS phase (was 1 when armed)
+ //   IN  completed: FULL set to 1 in STATUS phase (was 0 when armed)
+ // So undo when: AVAIL=1 (never started), or (OUT: FULL=1) or (IN: FULL=0)
+-static void __tusb_irq_path_func(epx_save_context)(hw_endpoint_t *ep) {
++// PicoMite: the undo is shared by preemption (epx_save_context) and by a failed transfer (xfer_complete_isr).
++static void __tusb_irq_path_func(epx_unwind_buffers)(hw_endpoint_t *ep) {
+   uint32_t   buf_ctrl = usbh_dpram->epx_buf_ctrl;
+   const bool is_out   = (tu_edpt_dir(ep->ep_addr) == TUSB_DIR_OUT);
+ 
+@@ -162,12 +189,19 @@
+       buf_ctrl = 0;
+     }
+   } while (buf_ctrl > 0);
++}
+ 
++static void __tusb_irq_path_func(epx_save_context)(hw_endpoint_t *ep) {
++  epx_unwind_buffers(ep);
+   usbh_dpram->epx_buf_ctrl = 0;
+ 
+   ep->state = EPSTATE_PENDING;
+ }
+ 
++#ifdef PC3_USB_EVLOG
++void pc3_evlog_add(uint32_t tag, uint32_t a, uint32_t b, uint32_t c); /* rp2040_usb.c (patched) */
++#endif
++
+ // switch epx to new endpoint and start the transfer
+ static void __tusb_irq_path_func(epx_switch_ep)(hw_endpoint_t *ep) {
+   const bool is_setup = (ep->state == EPSTATE_PENDING_SETUP);
+@@ -190,6 +224,11 @@
+     usb_hw->dev_addr_ctrl = (uint32_t)(ep->dev_addr | (tu_edpt_number(ep->ep_addr) << USB_ADDR_ENDP_ENDPOINT_LSB));
+     sie_start_xfer(is_setup, is_rx, ep->need_pre);
+   }
++#ifdef PC3_USB_EVLOG
++  /* 'W' EPX switch: pool index | dev_addr<<8 | ep_addr<<16 | setup<<24, EPX buffer control, next_pid | remaining<<16 */
++  pc3_evlog_add('W', (uint32_t)(ep - ep_pool) | ((uint32_t)ep->dev_addr << 8) | ((uint32_t)ep->ep_addr << 16) | ((uint32_t)is_setup << 24),
++                usbh_dpram->epx_buf_ctrl, ep->next_pid | ((uint32_t)ep->remaining_len << 16));
++#endif
+ }
+ 
+ TU_ATTR_ALWAYS_INLINE static inline bool epx_is_pending(const hw_endpoint_t *ep) {
+@@ -225,6 +264,29 @@
+   return NULL;
+ }
+ 
++/* PicoMite: restore TinyUSB 0.20's RX-timeout tolerance for CONTROL
++ * transfers, bounded. 0.20 never failed a transfer on RX_TIMEOUT - it
++ * cleared the status bit and let the SIE keep retrying, so a device slow
++ * to answer after a port reset (flash sticks, devices behind a slow hub)
++ * simply answered late. 0.21 fails the transfer on the first timeout;
++ * usbh's retries land back-to-back inside the same mute window and
++ * enumeration then abandons the device. Grace applies to endpoint 0
++ * only: NAKs - the normal slow-device flow control on bulk/interrupt -
++ * never raise RX_TIMEOUT, so a timeout there is a real error and keeps
++ * the fast-fail. The window is opened by the first timeout and closed
++ * ONLY when the control transfer itself ends - a control-pipe completion
++ * (xfer_complete_isr) or an abort/device close (epx_retire). Closing it
++ * on any completion would let hub status/HID traffic re-arm it forever
++ * and wedge the pipe.
++ *
++ * Still needed with master's enumeration retry (#3862, 430fcd222): on a
++ * Pico Computer 3 with a keyboard, mouse, gamepad and flash drive behind
++ * its hub, master without this window enumerated only the gamepad and
++ * the flash drive; with it, all four on every boot (2026-10-07). */
++#define PC3_CTRL_RX_TIMEOUT_GRACE_US (1000u * 1000u)
++static bool     pc3_rx_timeout_timing = false;
++static uint32_t pc3_rx_timeout_start_us;
++
+ // Release an unfinished EPX transfer's buffers: a STALL or RX timeout leaves one AVAILABLE, and a buffer completed
+ // before it leaves BUFF_STATUS pending, which the ISR would otherwise apply to the next transfer
+ static void __tusb_irq_path_func(epx_drop_buffers)(void) {
+@@ -238,6 +300,12 @@
+ // ISR cannot apply it to the next transfer. Caller holds the critical section and starts the next pending ep.
+ static void epx_retire(hw_endpoint_t *ep) {
+   if (ep == epx && ep->state == EPSTATE_ACTIVE) {
++    /* PicoMite: an aborted or closed control transfer ends its grace window,
++       as a completion does. Left open, the next control transfer - usually
++       the enumeration retry after this teardown - would find the window
++       already expired and fail on its first timeout. */
++    if (tu_edpt_number(ep->ep_addr) == 0)
++      pc3_rx_timeout_timing = false;
+     const bool is_setup = (usb_hw->sie_ctrl & USB_SIE_CTRL_SEND_SETUP_BITS) != 0;
+     sie_stop_xfer();
+     if (!is_setup) {
+@@ -270,13 +338,33 @@
+ //--------------------------------------------------------------------+
+ // Interrupt handlers
+ //--------------------------------------------------------------------+
++/* PicoMite: USB host fault record - rp2040_usb.c (patched). */
++void pm_usb_fault_note(uint8_t code, uint16_t info);
++#define PM_USB_FAULT_DATA_SEQ 1u
++#define PM_USB_FAULT_EP_FULL  4u
++
+ static void __tusb_irq_path_func(xfer_complete_isr)(hw_endpoint_t *ep, xfer_result_t xfer_result, bool is_more) {
++  if (tu_edpt_number(ep->ep_addr) == 0)
++    pc3_rx_timeout_timing = false; // control-pipe completion ends the grace window
+   if (ep == epx && xfer_result != XFER_RESULT_SUCCESS) {
++    /* PicoMite: give back the data toggle of every buffer that never completed. bufctrl_prepare16()
++       advanced next_pid when the buffer was armed; a transfer that fails (RX timeout, STALL) never
++       moved that packet, so the device still holds the old toggle. Left advanced, the next transfer
++       on this endpoint - cdc_host re-arms a failed IN at once - expects the other toggle, and the
++       device's next packet is dropped as a repeat (DATA_SEQ): one lost character per failure, seen as
++       echoes lost to COM3 while a low-speed keyboard on the hub was in use (its transactions raise
++       the RX timeout charged to EPX). Endpoint 0 restarts its toggle on every stage, so it is left alone. */
++    if (tu_edpt_number(ep->ep_addr) != 0) {
++      epx_unwind_buffers(ep);
++    }
+     epx_drop_buffers();
+   }
+ 
+   // Mark transfer as done before we tell the tinyusb stack
+   uint32_t xferred_len = ep->xferred_len;
++#ifdef PC3_USB_EVLOG
++  pc3_evlog_add('X', ep->ep_addr | ((uint32_t)ep->dev_addr << 8), xfer_result, xferred_len);
++#endif
+   rp2usb_reset_transfer(ep);
+   hcd_event_xfer_complete(ep->dev_addr, ep->ep_addr, xferred_len, xfer_result, true);
+ 
+@@ -379,12 +467,38 @@
+   }
+ 
+   if (epx->state == EPSTATE_ACTIVE) {
++    pm_epx_contend++;
+     if (epx_switch_request) {
+       // Second SOF with no transfer completion: endpoint is NAK-retrying, safe to switch.
+       epx_switch_request = false;
+-      sie_stop_xfer();
+-      epx_save_context(epx);
+-      epx_switch_ep(next_ep);
++      /* PicoMite: only preempt a transfer that has not moved any data yet.
++       * epx_save_context() must infer, from AVAIL/FULL alone, whether the
++       * packet it is unwinding completed on the wire; once a transfer is
++       * part-way through that inference can be wrong, and guessing wrong
++       * flips next_pid, so the device next reply arrives with the
++       * unexpected PID -> ERROR_DATA_SEQ.  With xferred_len == 0 there is
++       * nothing to unwind but the armed-and-unstarted buffer, which is the
++       * well-defined case.  Declining costs little: an endpoint that has
++       * already transferred data is by definition not NAK-starved, and its
++       * completion path (xfer_complete_isr with is_more) picks up the next
++       * pending endpoint at a clean packet boundary.  The RP2350
++       * stop-on-NAK path is untouched - the controller stops that one
++       * at a packet boundary, so it has no such ambiguity. */
++  #ifdef PM_EPX_PREEMPT_UNGUARDED
++      /* Diagnostic A/B only: stock 0.21.0 behaviour, preempt regardless. */
++      const bool pm_may_preempt = true;
++  #else
++      const bool pm_may_preempt = (epx->xferred_len == 0);
++  #endif
++      if (pm_may_preempt) {
++        pm_epx_switch++;
++        sie_stop_xfer();
++        epx_save_context(epx);
++        epx_switch_ep(next_ep);
++      }
++      else {
++        pm_epx_declined++;
++      }
+     } else {
+       epx_switch_request = true;
+     }
+@@ -422,6 +536,9 @@
+ 
+ static void __tusb_irq_path_func(hcd_rp2040_irq)(void) {
+   const uint32_t status = usb_hw->ints;
++#ifdef PC3_USB_EVLOG
++  pc3_evlog_add('I', status, usb_hw->sie_status, usb_hw->buf_status);
++#endif
+ 
+   if (status & USB_INTS_HOST_CONN_DIS_BITS) {
+     uint8_t speed = dev_speed();
+@@ -446,6 +563,20 @@
+   if (status & USB_INTS_ERROR_RX_TIMEOUT_BITS) {
+     usb_hw_clear->sie_status = USB_SIE_STATUS_RX_TIMEOUT_BITS;
+ 
++    /* PicoMite: within the grace window an endpoint-0 timeout is NOT a
++       failure - leave the transfer armed, the SIE retries on its own
++       (0.20 behaviour). No STOP_TRANS: that would cancel the retry. */
++    bool pc3_in_grace = false;
++    if (epx->state == EPSTATE_ACTIVE && tu_edpt_number(epx->ep_addr) == 0) {
++      const uint32_t now = time_us_32();
++      if (!pc3_rx_timeout_timing) {
++        pc3_rx_timeout_timing   = true;
++        pc3_rx_timeout_start_us = now;
++      }
++      pc3_in_grace = (uint32_t)(now - pc3_rx_timeout_start_us) < PC3_CTRL_RX_TIMEOUT_GRACE_US;
++    }
++
++    if (!pc3_in_grace) {
+     const uint32_t sie_ctrl = (usb_hw->sie_ctrl & SIE_CTRL_BASE_MASK) | USB_SIE_CTRL_STOP_TRANS_BITS;
+     usb_hw->sie_ctrl        = sie_ctrl;
+     // while (usb_hw->sie_ctrl & USB_SIE_CTRL_STOP_TRANS_BITS) {}
+@@ -455,6 +586,7 @@
+     if (epx->state == EPSTATE_ACTIVE) {
+       xfer_complete_isr(epx, XFER_RESULT_FAILED, false);
+     }
++    } /* !pc3_in_grace */
+   }
+ 
+   if (status & USB_INTS_TRANS_COMPLETE_BITS) {
+@@ -479,7 +611,20 @@
+     // epx may have been retired above (RX timeout) in the same interrupt: never restart or re-queue it
+     if (epx->state == EPSTATE_ACTIVE) {
+       hw_endpoint_t *next_ep = epx_next_pending(epx);
++#ifdef PC3_USB_EVLOG
++      /* 'N' stop on NAK: from | to<<8 (FF = restart in place) | from's xferred_len<<16, EPX buffer control,
++         from's next_pid | remaining_len<<16 - all before the unwind */
++      pc3_evlog_add('N', (uint32_t)(epx - ep_pool) | ((next_ep ? (uint32_t)(next_ep - ep_pool) : 0xFFu) << 8) |
++                    ((uint32_t)epx->xferred_len << 16), usbh_dpram->epx_buf_ctrl, epx->next_pid | ((uint32_t)epx->remaining_len << 16));
++#endif
+       if (next_ep != NULL) {
++        /* PicoMite: confirm the stop with STOP_TRANS before EPX is re-armed for another endpoint, as the RP2040's
++           SOF round-robin does. Re-armed straight after EPX_STOPPED_ON_NAK, with a low-speed device on the bus (a
++           mouse, polled through the hub), the next transfers went wrong: a USB serial adapter receiving kept EPX
++           switching on every NAK, and a flash drive's write lost data, after which the drive NAKed the rest of it
++           for good. With the stop confirmed, 3 of 3 runs passed with some 66,000 switches; no EPX completion ever
++           arrived after it, so what the controller kept was state, not a transaction in flight (2026-10-22). */
++        sie_stop_xfer();
+         epx_save_context(epx);
+         epx_switch_ep(next_ep);
+       } else {
+@@ -496,14 +641,34 @@
+ 
+   if (status & USB_INTS_ERROR_DATA_SEQ_BITS) {
+     usb_hw_clear->sie_status = USB_SIE_STATUS_DATA_SEQ_ERROR_BITS;
+-    panic("Data Seq Error \n");
++    /* PicoMite: was panic().  A data-toggle mismatch is a recoverable bus
++     * condition.  0.20 shipped the identical panic but never preempted a live
++     * transfer, so nothing ever desynchronised the toggle and it effectively
++     * could not fire; 0.21 EPX round-robin reconstructs the toggle by hand
++     * after a STOP_TRANS, which is the only way EPX can be switched on RP2040
++     * (no HAS_STOP_EPX_ON_NAK).  Clear the latch, record it, and let the SIE
++     * retry and usbh time the pipe out - exactly what 0.20 did. */
++    pm_usb_fault_note(PM_USB_FAULT_DATA_SEQ,
++                      (uint16_t)(epx->ep_addr | ((uint16_t)epx->dev_addr << 8)));
+   }
+ }
+ 
+ void __tusb_irq_path_func(hcd_int_handler)(uint8_t rhport, bool in_isr) {
+   (void)rhport;
+-  (void)in_isr;
+-  hcd_rp2040_irq();
++  if (in_isr) {
++    hcd_rp2040_irq();
++  } else {
++    /* PicoMite: a call from thread context - the application polling the controller, as MMBasic's C: drive does while
++       it waits for a transfer - must not be preempted by the USB interrupt running this same handler. Both saw one
++       EPX_STOPPED_ON_NAK and both switched EPX: the second switch re-armed EPX for another endpoint while the
++       controller was already running the first switch's transaction, so a flash drive's data packet landed in a CDC
++       receive's buffer (DATA_SEQ, corrupt reads) and a write lost a packet (the drive then NAKed its CSW for ever:
++       "A hard error occurred in the low level disk I/O layer"). Seen with a USB serial adapter receiving while
++       COPY ran from C:. 0.20 never switched EPX mid-transfer, so the same polling did no harm there. */
++    const uint32_t save = save_and_disable_interrupts();
++    hcd_rp2040_irq();
++    restore_interrupts(save);
++  }
+ }
+ 
+ //--------------------------------------------------------------------+
+@@ -531,9 +696,10 @@
+   // Enable in host mode with SOF / Keep alive on
+   usb_hw->main_ctrl = USB_MAIN_CTRL_CONTROLLER_EN_BITS | USB_MAIN_CTRL_HOST_NDEVICE_BITS;
+   usb_hw->sie_ctrl  = SIE_CTRL_BASE;
+-  usb_hw->inte      = USB_INTE_BUFF_STATUS_BITS | USB_INTE_HOST_CONN_DIS_BITS | USB_INTE_HOST_RESUME_BITS |
+-                 USB_INTE_STALL_BITS | USB_INTE_TRANS_COMPLETE_BITS | USB_INTE_ERROR_RX_TIMEOUT_BITS |
+-                 USB_INTE_ERROR_DATA_SEQ_BITS;
++  // HOST_RESUME stays off: no host suspend support, and nothing would clear SIE_STATUS.RESUME
++  // (PicoMite: upstream 51fe6d9 / #4181, the answer to our #4174; drop this hunk with the next pin update)
++  usb_hw->inte      = USB_INTE_BUFF_STATUS_BITS | USB_INTE_HOST_CONN_DIS_BITS | USB_INTE_STALL_BITS |
++                 USB_INTE_TRANS_COMPLETE_BITS | USB_INTE_ERROR_RX_TIMEOUT_BITS | USB_INTE_ERROR_DATA_SEQ_BITS;
+ 
+   #ifdef HAS_STOP_EPX_ON_NAK
+   usb_hw_set->inte = USB_INTE_EPX_STOPPED_ON_NAK_BITS;
+@@ -645,7 +811,10 @@
+   } else {
+     ep = edpt_alloc();
+   }
+-  TU_ASSERT(ep);
++  if (ep == NULL) { /* PicoMite: say so - the device's driver gets no endpoint and the device stays half-mounted */
++    pm_usb_fault_note(PM_USB_FAULT_EP_FULL, (uint16_t)(ep_desc->bEndpointAddress | ((uint16_t)dev_addr << 8)));
++    return false;
++  }
+ 
+   const uint8_t  ep_addr         = ep_desc->bEndpointAddress;
+   const uint16_t max_packet_size = tu_edpt_packet_size(ep_desc);
+@@ -672,7 +841,11 @@
+         break;
+       }
+     }
+-    assert(int_idx < USB_HOST_INTERRUPT_ENDPOINTS);
++    if (int_idx >= USB_HOST_INTERRUPT_ENDPOINTS) { /* PicoMite: all 15 hardware slots in use */
++      ep->max_packet_size = 0;                      // give the pool entry back
++      pm_usb_fault_note(PM_USB_FAULT_EP_FULL, (uint16_t)(ep_addr | ((uint16_t)dev_addr << 8)));
++      return false;
++    }
+     assert(ep_desc->bInterval > 0);
+ 
+     //------------- dpram buf -------------//
+@@ -837,6 +1010,12 @@
+   ep->ep_addr       = 0; // setup is OUT
+   ep->remaining_len = 8;
+   ep->xferred_len   = 0;
++#ifdef PC3_USB_EVLOG
++  /* 'U' SETUP: dev_addr | need_pre<<8 | queued-behind-EPX<<9, bmRequestType..wValue (bytes 0-3), wIndex..wLength */
++  pc3_evlog_add('U', dev_addr | ((uint32_t)ep->need_pre << 8) | ((uint32_t)(epx->state == EPSTATE_ACTIVE) << 9),
++                setup_packet[0] | ((uint32_t)setup_packet[1] << 8) | ((uint32_t)setup_packet[2] << 16) | ((uint32_t)setup_packet[3] << 24),
++                setup_packet[4] | ((uint32_t)setup_packet[5] << 8) | ((uint32_t)setup_packet[6] << 16) | ((uint32_t)setup_packet[7] << 24));
++#endif
+ 
+   // If EPX is busy, mark as pending setup (DPRAM already has the packet)
+   if (epx->state == EPSTATE_ACTIVE) {

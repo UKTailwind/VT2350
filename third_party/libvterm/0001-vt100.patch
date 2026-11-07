@@ -1,0 +1,89 @@
+diff --git a/src/state.c b/src/state.c
+index 54618d5..8ff1f6c 100644
+--- a/src/state.c
++++ b/src/state.c
+@@ -598,6 +598,11 @@ static void savecursor(VTermState *state, int save)
+     state->saved.mode.cursor_visible = state->mode.cursor_visible;
+     state->saved.mode.cursor_blink   = state->mode.cursor_blink;
+     state->saved.mode.cursor_shape   = state->mode.cursor_shape;
++    state->saved.mode.origin         = state->mode.origin;
++    state->saved.mode.autowrap       = state->mode.autowrap;
++    memcpy(state->saved.encoding, state->encoding, sizeof(state->saved.encoding));
++    state->saved.gl_set = state->gl_set;
++    state->saved.gr_set = state->gr_set;
+ 
+     vterm_state_savepen(state, 1);
+   }
+@@ -609,6 +614,11 @@ static void savecursor(VTermState *state, int save)
+     settermprop_bool(state, VTERM_PROP_CURSORVISIBLE, state->saved.mode.cursor_visible);
+     settermprop_bool(state, VTERM_PROP_CURSORBLINK,   state->saved.mode.cursor_blink);
+     settermprop_int (state, VTERM_PROP_CURSORSHAPE,   state->saved.mode.cursor_shape);
++    state->mode.origin   = state->saved.mode.origin;
++    state->mode.autowrap = state->saved.mode.autowrap;
++    memcpy(state->encoding, state->saved.encoding, sizeof(state->encoding));
++    state->gl_set = state->saved.gl_set;
++    state->gr_set = state->saved.gr_set;
+ 
+     vterm_state_savepen(state, 0);
+ 
+@@ -781,6 +791,33 @@ static void set_dec_mode(VTermState *state, int num, int val)
+     state->mode.cursor = val;
+     break;
+ 
++  case 2: // DECANM - reset, VT52 mode: the program's, which has to read what follows differently
++    if(!val && state->fallbacks && state->fallbacks->csi) {
++      long arg = 2;
++      (*state->fallbacks->csi)("?", &arg, 1, NULL, 'l', state->fbdata);
++    }
++    break;
++
++  case 3: // DECCOLM - the program changes the size, by the fallback. Then as on a VT100: the screen cleared, no margins, the cursor home
++    if(state->fallbacks && state->fallbacks->csi) {
++      long arg = 3;
++      (*state->fallbacks->csi)("?", &arg, 1, NULL, val ? 'h' : 'l', state->fbdata);
++    }
++    {
++      VTermPos oldpos = state->pos;
++      VTermRect rect = {.start_row = 0, .end_row = state->rows, .start_col = 0, .end_col = state->cols};
++      state->scrollregion_top = 0;
++      state->scrollregion_bottom = -1;
++      state->scrollregion_left = 0;
++      state->scrollregion_right = -1;
++      erase(state, rect, 0);
++      state->pos.row = 0;
++      state->pos.col = 0;
++      state->at_phantom = 0;
++      updatecursor(state, &oldpos, 1);
++    }
++    break;
++
+   case 5: // DECSCNM - screen mode
+     settermprop_bool(state, VTERM_PROP_REVERSE, val);
+     break;
+@@ -2162,6 +2199,8 @@ void vterm_state_reset(VTermState *state, int hard)
+     VTermRect rect = { 0, state->rows, 0, state->cols };
+     erase(state, rect, 0);
+   }
++
++  savecursor(state, 1);       // DECRC with no DECSC before it: what a reset leaves, not nothing
+ }
+ 
+ void vterm_state_get_cursorpos(const VTermState *state, VTermPos *cursorpos)
+diff --git a/src/vterm_internal.h b/src/vterm_internal.h
+index 4761063..afa9c23 100644
+--- a/src/vterm_internal.h
++++ b/src/vterm_internal.h
+@@ -145,7 +145,13 @@ struct VTermState
+       unsigned int cursor_visible:1;
+       unsigned int cursor_blink:1;
+       unsigned int cursor_shape:2;
++      unsigned int origin:1;
++      unsigned int autowrap:1;
+     } mode;
++
++    /* DECSC saves the character sets as well (the VT100's manual, and vttest) */
++    VTermEncodingInstance encoding[4];
++    int gl_set, gr_set;
+   } saved;
+ 
+   /* Temporary state for DECRQSS parsing */

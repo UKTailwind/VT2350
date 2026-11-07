@@ -1,0 +1,16 @@
+; debug_uart.pio: 8N1 at 8 PIO cycles a bit, from pico-examples (BSD-3-Clause).
+
+.program debug_tx
+.side_set 1 opt
+    pull       side 1 [7]   ; stop bit, and wait for data
+    set x, 7   side 0 [7]   ; start bit
+bitloop:
+    out pins, 1
+    jmp x-- bitloop [6]
+
+.program debug_rx
+    wait 0 pin 0            ; start bit
+    set x, 7 [10]           ; to the middle of the first data bit
+bitloop:
+    in pins, 1
+    jmp x-- bitloop [6]

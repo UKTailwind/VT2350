@@ -1,0 +1,194 @@
+--- a/src/portable/raspberrypi/rp2040/rp2040_usb.c
++++ b/src/portable/raspberrypi/rp2040/rp2040_usb.c
+@@ -12,6 +12,7 @@
+ 
+   #include <stdlib.h>
+   #include "rp2040_usb.h"
++  #include "hardware/timer.h" /* PicoMite: busy_wait_us_32 for a low-speed device's control packets */
+ 
+   #include "device/dcd.h"
+   #include "host/hcd.h"
+@@ -29,6 +30,92 @@
+ 
+ critical_section_t rp2usb_lock;
+ 
++/* PicoMite: USB host fault record.  The RP2 host driver answers three
++ * recoverable bus conditions with panic(), which on a PicoMite is both fatal
++ * and invisible: pico-stdio is not wired to the console, so panic()'s message
++ * is discarded and the breakpoint in _exit() surfaces only as MMBasic's own
++ * "*** FAULT PC=..." line (RP2040 has no CFSR/HFSR, so those print as zero and
++ * say nothing).  Record and recover instead; PicoMite reports the record from
++ * the main loop, off the interrupt (USB_fault_service, input/USBKeyboard.c).
++ *
++ * ONE COUNTER PER CODE.  The first version kept a single total plus a
++ * "last code" byte, which the reporter read at a different moment from the
++ * total - so a report could pair a count with the wrong label (a field log
++ * showed BUFCTRL32 and DATA_SEQ both claiming to be the 4th fault).  Counts
++ * were right, labels were not.  Per-code counters remove the race entirely.
++ * Readable from BASIC with PEEK for field diagnosis. */
++#define PM_USB_FAULT_DATA_SEQ  1u
++#define PM_USB_FAULT_BUFCTRL32 2u
++#define PM_USB_FAULT_BUFCTRL16 3u
++#define PM_USB_FAULT_EP_FULL   4u /* hcd_edpt_open: no free ep_pool entry or interrupt slot */
++#define PM_USB_FAULT_NCODES    5u /* codes 1..4 */
++volatile uint16_t pm_usb_fault_n[PM_USB_FAULT_NCODES];
++/* Which endpoint the LAST fault of each code happened on - the single most
++   useful thing to know, because rp2usb_buffer_start() arms EVERY endpoint
++   class through bufctrl_write32(), so the code alone cannot distinguish a
++   control-pipe problem from an interrupt-endpoint one.
++     BUFCTRL32/16 -> low 16 bits of the buffer-control register address, i.e.
++       the host DPRAM offset: 0x080 = EPX (control/bulk), 0x088 = interrupt
++       endpoint 1, 0x090 = IEP2, 0x098 = IEP3 ... (+8 per endpoint).
++     DATA_SEQ     -> ep_addr | dev_addr<<8 of whatever EPX was doing.
++     EP_FULL      -> ep_addr | dev_addr<<8 of the endpoint that could not be opened. */
++volatile uint16_t pm_usb_fault_ep[PM_USB_FAULT_NCODES];
++volatile uint16_t pm_usb_fault_total;
++void __tusb_irq_path_func(pm_usb_fault_note)(uint8_t code, uint16_t info) {
++  if (code < PM_USB_FAULT_NCODES && pm_usb_fault_n[code] != 0xFFFFu) {
++    pm_usb_fault_n[code]++;
++    pm_usb_fault_ep[code] = info;
++  }
++  if (pm_usb_fault_total != 0xFFFFu) {
++    pm_usb_fault_total++;
++  }
++}
++
++#ifdef PC3_USB_EVLOG
++#include "hardware/timer.h"
++/* PC3: timing-neutral event ring for the USB host driver.  A UART print in
++ * the interrupt path made a multi-device enumeration succeed that fails
++ * without it (2026-09-01), so the instrument must not take time: four
++ * stores per event, read back over the REPL from Python (address from the
++ * ELF's pc3_evlog symbol).  Tags: 'S' transfer start (ep_addr|dev_addr<<8,
++ * total_len, 0), 'C' buffer completion (buf_id|is_double<<8|is_done<<16,
++ * bc32, xact|remaining<<16), 'I' hcd interrupt (ints, sie_status, buf_status),
++ * 'X' transfer complete to the stack (ep_addr|dev_addr<<8, result, len);
++ * hcd_rp2040.c adds 'U' SETUP, 'N' stop on NAK and 'W' EPX switch. */
++typedef struct { uint32_t t; uint32_t tag; uint32_t a; uint32_t b; uint32_t c; } pc3_ev_t;
++#ifndef PC3_EVLOG_N /* PicoMite: overridable - HDMIUSB has ~2.7 KB BSS headroom, 256*20B does not fit */
++#define PC3_EVLOG_N 256
++#endif
++volatile pc3_ev_t pc3_evlog[PC3_EVLOG_N];
++volatile uint32_t pc3_evlog_n;
++/* PicoMite: freeze the ring shortly after the FIRST failed transfer so the
++   lead-up and the failure survive instead of being overwritten by later
++   traffic (a whole failed multi-device enumeration is ~750 events; the ring
++   holds 112). -1 = armed, >0 = events still to record, 0 = frozen. PEEK
++   pc3_evlog_freeze to see whether a failure triggered. */
++volatile int32_t pc3_evlog_freeze = -1;
++void pc3_evlog_add(uint32_t tag, uint32_t a, uint32_t b, uint32_t c) {
++    if (pc3_evlog_freeze == 0) return;
++    /* a repeat of one of the last 8 events only counts, in tag bits 8-31: a NAK ping-pong between two pending
++       transfers would otherwise flush the lead-up to a failure out of the ring in a millisecond */
++    uint32_t n0 = pc3_evlog_n;
++    for (uint32_t k = 1; k <= 8 && k <= n0; k++) {
++        volatile pc3_ev_t *p = &pc3_evlog[(n0 - k) % PC3_EVLOG_N];
++        if ((p->tag & 0xFFu) == tag && p->a == a && p->b == b && p->c == c) {
++            if ((p->tag >> 8) < 0xFFFFFFu) p->tag += 0x100u;
++            return;
++        }
++    }
++    if (pc3_evlog_freeze > 0) pc3_evlog_freeze--;
++    uint32_t i = pc3_evlog_n++;
++    volatile pc3_ev_t *e = &pc3_evlog[i % PC3_EVLOG_N];
++    e->t = time_us_32();
++    e->tag = tag; e->a = a; e->b = b; e->c = c;
++    if (tag == 'X' && b != 0 /* xfer_result != SUCCESS */ && pc3_evlog_freeze < 0)
++        pc3_evlog_freeze = 40;
++}
++#endif
++
+ //--------------------------------------------------------------------+
+ // Implementation
+ //--------------------------------------------------------------------+
+@@ -103,7 +190,13 @@
+   const uint32_t current    = *buf_reg;
+   const uint32_t avail_mask = USB_BUF_CTRL_AVAIL | (USB_BUF_CTRL_AVAIL << 16);
+   if (current & value & avail_mask) {
+-    panic("buf_ctrl @ 0x%lX already available", (uintptr_t)buf_reg);
++    /* PicoMite: was panic().  A still-armed AVAIL means the controller never
++     * finished the previous transfer on this buffer (a STOP_TRANS that raced,
++     * or a buffer abandoned on error).  Dropping the stale arming is exactly
++     * what the caller is about to do anyway, so clear it and re-arm rather
++     * than killing MMBasic. */
++    pm_usb_fault_note(PM_USB_FAULT_BUFCTRL32, (uint16_t)(uintptr_t)buf_reg);
++    *buf_reg = 0;
+   }
+   *buf_reg = value & ~(USB_BUF_CTRL_AVAIL | (USB_BUF_CTRL_AVAIL << 16)); // write other bits first
+ 
+@@ -121,7 +214,9 @@
+ void __tusb_irq_path_func(bufctrl_write16)(io_rw_16 *buf_reg16, uint16_t value) {
+   const uint16_t current = *buf_reg16;
+   if (current & value & USB_BUF_CTRL_AVAIL) {
+-    panic("buf_ctrl @ 0x%lX already available", (uintptr_t)buf_reg16);
++    /* PicoMite: was panic() - see bufctrl_write32(). */
++    pm_usb_fault_note(PM_USB_FAULT_BUFCTRL16, (uint16_t)(uintptr_t)buf_reg16);
++    *buf_reg16 = 0;
+   }
+   *buf_reg16 = value & (uint16_t)~USB_BUF_CTRL_AVAIL; // write other bits first
+ 
+@@ -186,7 +281,15 @@
+     // double-buffered bulk path is unaffected.)
+     const bool is_iso = (((ep_ctrl >> EP_CTRL_BUFFER_TYPE_LSB) & 0x3u) == TUSB_XFER_ISOCHRONOUS);
+   #if CFG_TUH_ENABLED
+-    const bool force_single = is_iso || (rp2usb_is_host_mode() && ep->interrupt_num > 0);
++    /* PicoMite (TinyUSB #3875): single-buffer host CONTROL transfers as well
++     * as interrupt ones - on RP2350 only (RP2040-E4 makes single-buffered
++     * multi-packet host transfers unsafe there). A 9-packet control IN
++     * double-buffered on EPX completed after the first 64 bytes with the other
++     * buffer still armed, and the status stage hit "buf_ctrl already
++     * available". Full rationale in tinyusb-0.21's copy of this file. */
++    const bool force_single = is_iso || (rp2usb_is_host_mode() &&
++                              (ep->interrupt_num > 0 ||
++                               (tu_edpt_number(ep->ep_addr) == 0 && !CFG_TUSB_RP2_ERRATA_E4)));
+   #else
+     const bool force_single = is_iso;
+   #endif
+@@ -220,6 +323,9 @@
+   ep->remaining_len = total_len;
+   ep->xferred_len   = 0;
+   ep->state         = EPSTATE_ACTIVE;
++#ifdef PC3_USB_EVLOG
++  pc3_evlog_add('S', ep->ep_addr | ((uint32_t)ep->dev_addr << 8), total_len, 0);
++#endif
+ 
+   #if CFG_TUD_EDPT_DEDICATED_HWFIFO
+   if (ff != NULL) {
+@@ -346,6 +452,16 @@
+   const bool     is_last    = buf_ctrl16 & USB_BUF_CTRL_LAST;
+   const bool     is_short   = xact_bytes < ep->max_packet_size;
+   const bool     is_done    = is_short || is_last;
++#ifdef PC3_USB_EVLOG
++  pc3_evlog_add('C', buf_id | ((uint32_t)is_double << 8) | ((uint32_t)is_done << 16),
++                *buf_reg, xact_bytes | ((uint32_t)ep->remaining_len << 16));
++#endif
++#ifdef PC3_USB_TRACE
++  if (is_host && !is_double) {
++    TU_LOG2("PC3 epx cont: id %u bc32 %08lx xact %u last %u rem %u done %u pid %u\r\n", buf_id,
++            (unsigned long)*buf_reg, xact_bytes, is_last, ep->remaining_len, is_done, ep->next_pid);
++  }
++#endif
+ 
+   // Short packet on rx with double buffer: abort the other half (if not last) and reset the buffer control.
+   // The other buffer may be: (a) still AVAIL, (b) in-progress (controller receiving), or (c) already completed.
+@@ -416,6 +532,20 @@
+   #endif
+     {
+       // ping-pong: arm the completed buffer with new data
++  #if CFG_TUH_ENABLED
++      /* PicoMite: a low-speed device behind hubs needs time before its next packet. The buffer-done interrupt
++         comes as soon as the data packet has arrived; re-armed at once, the controller sent the next request
++         while the outer hub was still relaying the host's low-speed handshake, the reply came back garbled
++         (BIT_STUFF) and the controller locked up - every USB device stopped until a restart. Seen on a PC3 with a
++         low-speed mouse behind the Raspberry Pi keyboard's hub, reading an 88-byte string at enumeration
++         (6.03.01, with TinyUSB 0.20, enumerates it). Measured: a 10 us wait still
++         failed, 25 and 50 us passed, but with a second CDC adapter and a gamepad as well 50 us failed and 100 us
++         passed 3 times of 3. Only multi-packet control transfers to a low-speed device take
++         this path, at enumeration and little else. */
++      if (is_host && ep->need_pre && tu_edpt_number(ep->ep_addr) == 0) {
++        busy_wait_us_32(100);
++      }
++  #endif
+       const uint16_t buf_ctrl16_new = bufctrl_prepare16(ep, dpram_buf, is_rx);
+       bufctrl_write16(buf_reg16 + buf_id, buf_ctrl16_new);
+     }

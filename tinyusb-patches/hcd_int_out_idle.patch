@@ -1,0 +1,49 @@
+--- a/src/portable/raspberrypi/rp2040/hcd_rp2040.c
++++ b/src/portable/raspberrypi/rp2040/hcd_rp2040.c
+@@ -469,6 +469,9 @@
+         io_rw_32  *buf_reg = dpram_int_ep_buffer_ctrl(ep->interrupt_num);
+         const bool done    = rp2usb_xfer_continue(ep, ep_reg, buf_reg, 0, tu_edpt_dir(ep->ep_addr) == TUSB_DIR_IN);
+         if (done) {
++          if (tu_edpt_dir(ep->ep_addr) == TUSB_DIR_OUT) {
++            usb_hw_clear->int_ep_ctrl = TU_BIT(ep->interrupt_num); // nothing more to send: see hcd_edpt_open
++          }
+           xfer_complete_isr(ep, XFER_RESULT_SUCCESS, false);
+         }
+         break;
+@@ -493,7 +496,9 @@
+   } else {
+     rp2usb_reset_transfer(ep);
+   }
+-  usb_hw_set->int_ep_ctrl = TU_BIT(ep->interrupt_num);
++  if (tu_edpt_dir(ep->ep_addr) == TUSB_DIR_IN || ep->state == EPSTATE_ACTIVE) {
++    usb_hw_set->int_ep_ctrl = TU_BIT(ep->interrupt_num);
++  }
+ }
+ 
+   #ifndef HAS_STOP_EPX_ON_NAK
+@@ -948,8 +953,13 @@
+     }
+     usb_hw->int_ep_addr_ctrl[int_idx] = addr_ctrl;
+ 
+-    // Finally, activate interrupt endpoint
+-    usb_hw_set->int_ep_ctrl = TU_BIT(ep->interrupt_num);
++    // Finally, activate interrupt endpoint. VT2350: an OUT only from hcd_edpt_xfer to the end of its transfer. The controller
++    // gives every enabled endpoint its turn at the start of a frame whether it has anything to send or not, and bulk transfers
++    // on EPX suffer once there are enough of them: with five, a mouse's idle OUT among them, a flash drive's writes failed, and
++    // with that one off they passed.
++    if (tu_edpt_dir(ep_addr) == TUSB_DIR_IN) {
++      usb_hw_set->int_ep_ctrl = TU_BIT(ep->interrupt_num);
++    }
+   }
+ 
+   return true;
+@@ -1028,6 +1038,9 @@
+     } else {
+       rp2usb_xfer_start(ep, dpram_int_ep_ctrl(ep->interrupt_num), dpram_int_ep_buffer_ctrl(ep->interrupt_num), buffer,
+                         NULL, buflen);
++      if (tu_edpt_dir(ep_addr) == TUSB_DIR_OUT) {
++        usb_hw_set->int_ep_ctrl = TU_BIT(ep->interrupt_num);
++      }
+     }
+     rp2usb_critical_exit();
+     return ret;
