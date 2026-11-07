@@ -246,7 +246,25 @@ def body(m):
         ['USB port', 'USB host, for the keyboard, mouse and USB serial devices'],
     ])
     m.para('**The UARTs are 3.3 V logic.** Join the two grounds, and cross the lines over: transmit on one end goes to receive on the other. A real RS-232 port needs a level converter.')
-    m.para('**The USB port has to supply 5 V.** It is working as a host, so the power for the keyboard and hub comes from your board. On a Pico 2 that means an OTG adapter on the USB socket, and 5 V fed to the VBUS pin (pin 40). A powered hub takes the load off the board.')
+    m.para('**The USB port has to supply 5 V.** It is working as a host, so the power for the keyboard and hub comes from your board. The next part shows how to do that on a Pico 2.')
+    m.room(62)
+    m.h2('The smallest build')
+    m.para('This is the least you can build a complete terminal from. There is nothing to wire but the 5 V supply.')
+    m.table([60, 110], ['Part', 'What it does'], [
+        ['Pico 2, with headers', 'The terminal'],
+        ['HSTX DVI sock', 'The HDMI socket, plugged on to GP12 to GP19'],
+        ['Micro-USB to USB-A socket adapter', 'Turns the Pico 2\'s USB socket into a full-size one'],
+        ['USB hub, unpowered', 'Gives you sockets for a keyboard, a mouse and a USB serial device'],
+        ['5 V supply', 'Powers the Pico 2, and through it the hub and all that is on it'],
+    ])
+    m.items([
+        'Install the firmware first, with the Pico 2 on its own (section 3).',
+        'Fit the sock and connect the monitor. The sock is wired the way the terminal expects, so it needs no straps.',
+        'Plug the adapter into the Pico 2, the hub into the adapter, and the keyboard into the hub.',
+        'Connect the 5 V supply: positive to **VBUS (pin 40)** and negative to **GND (pin 38)**.',
+    ], numbered=True)
+    m.para('The supply has to go to VBUS. VSYS (pin 39) will power the Pico 2, but the power doesn\'t reach the USB socket from there, and the keyboard stays dead. Use a supply rated at 2 A.')
+    m.para('**Never connect the 5 V supply and a PC at the same time.** VBUS is joined straight to the USB socket, so the two supplies would be connected together. Disconnect the supply before you plug the Pico 2 into a PC to install or update the firmware.')
 
     m.h1('Installing it')
     m.items([
@@ -255,7 +273,8 @@ def body(m):
         'Unplug the PC, and connect the keyboard or hub, the monitor and the serial line.',
     ], numbered=True)
     m.h2('Updating it')
-    m.para('Choose **Firmware update** in the setup menu, or hold BOOTSEL while powering up. Then connect the board\'s USB port to a PC instead of the hub, and copy the new UF2 to the RP2350 drive. Saved settings stay, unless the new version saves different things, when it starts from the defaults.')
+    m.para('Disconnect any 5 V supply, hold down BOOTSEL, and connect the board\'s USB port to a PC instead of the hub. Then copy the new UF2 to the RP2350 drive. On a board that stays powered while its USB port moves to a PC, **Firmware update** in the setup menu does the same without BOOTSEL.')
+    m.para('Saved settings stay, unless the new version saves different things, when it starts from the defaults.')
 
     m.h1('First use')
     m.para('Power it up. The screen clears, and the last line is the status line:')
@@ -396,7 +415,7 @@ def body(m):
     m.h1('If something is wrong')
     m.table([64, 106], ['What happens', 'What to try'], [
         ['No picture, or the wrong colours', 'The HDMI wiring: section 10'],
-        ['The keyboard does nothing', 'Check the USB port is getting 5 V, and try a powered hub. Give the board about 12 seconds after it starts to find what is on a hub'],
+        ['The keyboard does nothing', 'Check the USB port is getting 5 V: on a Pico 2 the supply must go to VBUS, not VSYS. Give the board about 12 seconds after it starts to find what is on a hub. If it still does nothing, try a powered hub'],
         ['Nothing appears from the host', 'Check the status line shows the right port and speed. On a UART, check transmit and receive are crossed over and the grounds are joined'],
         ['Rubbish on the screen', 'The Speed or Format differs from the host\'s'],
         ['Every line starts where the last one ended', 'Set LF received as to CR LF'],
