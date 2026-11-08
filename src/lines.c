@@ -126,7 +126,8 @@ static int cdc_setup(int idx) {
     }
     res = XFER_RESULT_INVALID;
     tuh_cdc_set_control_line_state(idx, CDC_CONTROL_LINE_STATE_DTR | CDC_CONTROL_LINE_STATE_RTS, NULL, (uintptr_t)&res);
-    if(res != XFER_RESULT_INVALID && res != XFER_RESULT_SUCCESS) {
+    /* A STALL is the device saying it has no such request (the Microbridge, 04D8:000A, stalls every one): it opens without DTR */
+    if(res != XFER_RESULT_INVALID && res != XFER_RESULT_SUCCESS && res != XFER_RESULT_STALLED) {
         snprintf(error_text, sizeof(error_text), "the device refused DTR");
         return -1;
     }

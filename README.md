@@ -60,7 +60,7 @@ What costs the time is lines, not bytes: each one scrolls. Measured on a Pico Co
 | 6x12 | 106 x 39 | no loss | loses data: keeps up with about 73 KB/s |
 | 5x8 | 128 x 59 | no loss | loses data: keeps up with about 65 KB/s |
 
-Longer lines are easier. Where a host can send that fast for more than the 16 KB receive ring lasts, set Flow control to XON/XOFF in the menu. A USB serial device has been measured at 46 to 81 KB/s with no loss.
+Longer lines are easier. Where a host can send that fast for more than the 16 KB receive ring lasts, set Flow control to XON/XOFF in the menu. A USB serial device has been measured at 46 to 81 KB/s with no loss. The Microbridge (the USB serial chip on a Colour Maximite 2 Generation 1) works at up to 115200 baud, without DTR or RTS, and the MCP2221A only at up to 57600: it has no flow control.
 
 ## Building
 

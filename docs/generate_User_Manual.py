@@ -366,6 +366,11 @@ def body(m):
     m.h1('The serial lines')
     m.h2('USB serial devices')
     m.para('Up to four can be connected, as USB1 to USB4 in the order they are found. Devices that follow the USB CDC standard work, including PicoMites, as do those with FTDI, CP210x, CH34x and PL2303 chips.')
+    m.para('Two bridges found on Maximite boards have a top speed:')
+    m.items([
+        '**The Microbridge**, the USB serial chip on a Colour Maximite 2 Generation 1 and other boards, works at up to 115200 baud. It has no DTR or RTS, and the terminal opens it without them.',
+        '**The MCP2221A** works only at up to 57600 baud. It has no flow control, and at 115200 it loses characters on continuous output. Set the board at the other end to the same speed.',
+    ])
     m.para('If the device you choose is not there, the status line says `no USB serial device there`, and the terminal keeps looking for it. If it is unplugged, the status line says so, and the port opens again when it comes back.')
     m.h2('How fast it keeps up')
     m.para('What takes the time is lines, not bytes, as each new line scrolls the screen. Short lines sent without a pause are the hardest thing a host can do. With 64-byte lines:')
@@ -428,6 +433,7 @@ def body(m):
         ['The mouse wheel stopped scrolling', 'A program has asked for the mouse. It stops when the program turns reporting off'],
         ['Settings are lost at power-off', 'Choose Save settings in the menu'],
         ['USB1 shows no USB serial device', 'Check it is plugged in. If several are, it may be USB2 to USB4'],
+        ['Characters go missing from a board with an MCP2221A', 'Use 57600 baud or less, at both ends: section 9'],
     ])
 
     m.h1('Licence and credits')
